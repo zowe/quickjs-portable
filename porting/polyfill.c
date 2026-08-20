@@ -45,50 +45,79 @@ void execChildError(const char *what){
 }
 #endif
 
-#if defined(__XPLINK__)
-int32_t atomicIncrementI32(int32_t *place, int32_t increment){
-  int32_t oldValue = 0;
-  int32_t newValue = 0;  /* just to let compiler figure out a register */
+// zosCas32/64 = z/OS Compare And Swap
+static _Bool zosCas32(uint32_t *place, uint32_t *expected, uint32_t desired){
+  uint32_t oldValue = *expected;
   int pswMask = 0;
 #ifdef _LP64
   int64_t addr = (int64_t)place;
-#else 
+  __asm("         L  9,%0    \n"
+        "         L  10,%2   \n"
+        "         LG 11,%3   \n"
+        "         CS 9,10,0(11) \n"
+        "         ST 9,%0    \n"
+        "         EPSW 10,0  \n"
+        "         ST 10,%1   "
+        : "+m"(oldValue), "=m"(pswMask)
+        : "m"(desired), "m"(addr)
+        : "r9","r10","r11","memory");
+#else
   int32_t addr = (int32_t)place;
+  __asm("         L  9,%0    \n"
+        "         L  10,%2   \n"
+        "         L  11,%3   \n"
+        "         CS 9,10,0(11) \n"
+        "         ST 9,%0    \n"
+        "         EPSW 10,0  \n"
+        "         ST 10,%1   "
+        : "+m"(oldValue), "=m"(pswMask)
+        : "m"(desired), "m"(addr)
+        : "r9","r10","r11","memory");
 #endif
-  while (1){
-    oldValue = *place;
-    newValue = oldValue+increment;
-    /* printf("old=%d new=%d\n",oldValue,newValue); */
-    __asm("         L  9,%0   \n"
-          "         L  10,%1   \n"
-	  "         LG 11,%2  \n"
-	  "         CS 9,10,0(11) \n"
-	  "         EPSW 10,0 note re-use of r10 \n"
-	  "         ST 10,%3 "
-	  :
-	  :
-	  "m"(oldValue),"m"(newValue),"m"(addr),"m"(pswMask)
-	  :
-	  "r9","r10","r11");
-    int cc = 0x3000 & pswMask;
-    /* printf("pswMask=0x%08X, old=%d\n",pswMask,oldValue); */
-    if (cc == 0){ /* Pseudo JZ out of loop */
-      break;
-    }
-  }
-  return oldValue;
+  *expected = oldValue;
+  return (_Bool)((pswMask & 0x3000) == 0);
 }
 
-#else 
+static _Bool zosCas64(uint64_t *place, uint64_t *expected, uint64_t desired){
+  uint64_t oldValue = *expected;
+  int pswMask = 0;
+#ifdef _LP64
+  int64_t addr = (int64_t)place;
+  __asm("         LG  9,%0    \n"
+        "         LG  10,%2   \n"
+        "         LG  11,%3   \n"
+        "         CSG 9,10,0(11) \n"  // COMPARE AND SWAP (64-bit)
+        "         STG 9,%0    \n"
+        "         EPSW 10,0   \n"
+        "         ST  10,%1   "
+        : "+m"(oldValue), "=m"(pswMask)
+        : "m"(desired), "m"(addr)
+        : "r9","r10","r11","memory");
+#else
+  int32_t addr = (int32_t)place;
+  __asm("         LM  8,9,%0   \n"
+        "         LM  10,11,%2 \n"
+        "         L   12,%3    \n"
+        "         CDS 8,10,0(12) \n"  // COMPARE DOUBLE AND SWAP
+        "         STM 8,9,%0   \n"
+        "         EPSW 12,0    \n"
+        "         ST  12,%1    "
+        : "+m"(oldValue), "=m"(pswMask)
+        : "m"(desired), "m"(addr)
+        : "r8","r9","r10","r11","r12","memory");
+#endif
+  *expected = oldValue;
+  return (_Bool)((pswMask & 0x3000) == 0);
+}
 
 int32_t atomicIncrementI32(int32_t *place, int32_t increment){
-  int old = *place;
-  /* printf("Ay caramba\n"); */
-  *place = (old + increment);
-  return old;
+  uint32_t oldValue = *(uint32_t *)place;
+  uint32_t newValue;
+  do {
+    newValue = oldValue + (uint32_t)increment;
+  } while (!zosCas32((uint32_t *)place, &oldValue, newValue));
+  return (int32_t)oldValue;
 }
-
-#endif
 
 
 /*
@@ -233,160 +262,87 @@ int changeExtendedAttributes(const char *pathname, int attribute, bool onOff){
   return res;
 }
 
+static uint32_t zosSubwordShift(const volatile void *p, int width, uint32_t **outWord){
+  uintptr_t addr = (uintptr_t)p;
+  uintptr_t wordAddr = addr & ~(uintptr_t)3;
+  *outWord = (uint32_t *)wordAddr;
+  /* z/Architecture is big-endian: byte 0 of the word is the MSB. */
+  return (uint32_t)((4 - width - (int)(addr - wordAddr)) * 8);
+}
+
+#define ZOS_WORD_RMW(NAME, PTRTYPE, CTYPE, EXPR) \
+CTYPE NAME(PTRTYPE *p, CTYPE x){ \
+  uint32_t oldValue = *(uint32_t *)p; \
+  uint32_t newValue; \
+  CTYPE oldSub; \
+  do { \
+    oldSub = (CTYPE)oldValue; \
+    newValue = (uint32_t)(CTYPE)(EXPR); \
+  } while (!zosCas32((uint32_t *)p, &oldValue, newValue)); \
+  return oldSub; \
+}
+
+#define ZOS_DWORD_RMW(NAME, CTYPE, EXPR) \
+CTYPE NAME(_Atomic(CTYPE) *p, CTYPE x){ \
+  uint64_t oldValue = *(uint64_t *)p; \
+  uint64_t newValue; \
+  CTYPE oldSub; \
+  do { \
+    oldSub = (CTYPE)oldValue; \
+    newValue = (uint64_t)(CTYPE)(EXPR); \
+  } while (!zosCas64((uint64_t *)p, &oldValue, newValue)); \
+  return oldSub; \
+}
+
+#define ZOS_SUBWORD_RMW(NAME, CTYPE, WIDTH, MASK, EXPR) \
+CTYPE NAME(_Atomic(CTYPE) *p, CTYPE x){ \
+  uint32_t *word; \
+  uint32_t shift = zosSubwordShift(p, (WIDTH), &word); \
+  uint32_t oldWord = *word; \
+  uint32_t newWord; \
+  CTYPE oldSub; \
+  do { \
+    oldSub = (CTYPE)((oldWord >> shift) & (MASK)); \
+    CTYPE newSub = (CTYPE)(EXPR); \
+    newWord = (oldWord & ~((MASK) << shift)) | (((uint32_t)newSub & (MASK)) << shift); \
+  } while (!zosCas32(word, &oldWord, newWord)); \
+  return oldSub; \
+}
+
 /* ADD */
-int atomicAddInt(int *p, int x){
-  int old = *p;
-  *p = old+x;
-  return old;
-}
-
-uint64_t atomicAddU64(_Atomic(uint64_t) *p, uint64_t x){
-  uint64_t old = *p;
-  *p = old+x;
-  return old;
-}
-
-uint32_t atomicAddU32(_Atomic(uint32_t) *p, uint32_t x){
-  uint32_t old = *p;
-  *p = old+x;
-  return old;
-}
-
-uint16_t atomicAddU16(_Atomic(uint16_t) *p, uint16_t x){
-  uint16_t old = *p;
-  *p = old+x;
-  return old;
-}
-
-uint8_t atomicAddU8(_Atomic(uint8_t) *p, uint8_t x){
-  uint8_t old = *p;
-  *p = old+x;
-  return old;
-}
+ZOS_WORD_RMW(atomicAddInt, int, int, oldSub + x)
+ZOS_DWORD_RMW(atomicAddU64, uint64_t, oldSub + x)
+ZOS_WORD_RMW(atomicAddU32, _Atomic(uint32_t), uint32_t, oldSub + x)
+ZOS_SUBWORD_RMW(atomicAddU16, uint16_t, 2, 0xFFFFu, oldSub + x)
+ZOS_SUBWORD_RMW(atomicAddU8, uint8_t, 1, 0xFFu, oldSub + x)
 
 /* SUB */
-int atomicSubInt(int *p, int x){
-  int old = *p;
-  *p = old-x;
-  return old;
-}
-
-uint64_t atomicSubU64(_Atomic(uint64_t) *p, uint64_t x){
-  uint64_t old = *p;
-  *p = old-x;
-  return old;
-}
-
-uint32_t atomicSubU32(_Atomic(uint32_t) *p, uint32_t x){
-  uint32_t old = *p;
-  *p = old-x;
-  return old;
-}
-
-uint16_t atomicSubU16(_Atomic(uint16_t) *p, uint16_t x){
-  uint16_t old = *p;
-  *p = old-x;
-  return old;
-}
-
-uint8_t atomicSubU8(_Atomic(uint8_t) *p, uint8_t x){
-  uint8_t old = *p;
-  *p = old-x;
-  return old;
-}
+ZOS_WORD_RMW(atomicSubInt, int, int, oldSub - x)
+ZOS_DWORD_RMW(atomicSubU64, uint64_t, oldSub - x)
+ZOS_WORD_RMW(atomicSubU32, _Atomic(uint32_t), uint32_t, oldSub - x)
+ZOS_SUBWORD_RMW(atomicSubU16, uint16_t, 2, 0xFFFFu, oldSub - x)
+ZOS_SUBWORD_RMW(atomicSubU8, uint8_t, 1, 0xFFu, oldSub - x)
 
 /* AND */
-int atomicAndInt(int *p, int x){
-  int old = *p;
-  *p = old & x;
-  return old;
-}
-
-uint64_t atomicAndU64(_Atomic(uint64_t) *p, uint64_t x){
-  uint64_t old = *p;
-  *p = old & x;
-  return old;
-}
-
-uint32_t atomicAndU32(_Atomic(uint32_t) *p, uint32_t x){
-  uint32_t old = *p;
-  *p = old & x;
-  return old;
-}
-
-uint16_t atomicAndU16(_Atomic(uint16_t) *p, uint16_t x){
-  uint16_t old = *p;
-  *p = old & x;
-  return old;
-}
-
-uint8_t atomicAndU8(_Atomic(uint8_t) *p, uint8_t x){
-  uint8_t old = *p;
-  *p = old & x;
-  return old;
-}
+ZOS_WORD_RMW(atomicAndInt, int, int, oldSub & x)
+ZOS_DWORD_RMW(atomicAndU64, uint64_t, oldSub & x)
+ZOS_WORD_RMW(atomicAndU32, _Atomic(uint32_t), uint32_t, oldSub & x)
+ZOS_SUBWORD_RMW(atomicAndU16, uint16_t, 2, 0xFFFFu, oldSub & x)
+ZOS_SUBWORD_RMW(atomicAndU8, uint8_t, 1, 0xFFu, oldSub & x)
 
 /* OR */
-int atomicOrInt(int *p, int x){
-  int old = *p;
-  *p = old | x;
-  return old;
-}
-
-uint64_t atomicOrU64(_Atomic(uint64_t) *p, uint64_t x){
-  uint64_t old = *p;
-  *p = old | x;
-  return old;
-}
-
-uint32_t atomicOrU32(_Atomic(uint32_t) *p, uint32_t x){
-  uint32_t old = *p;
-  *p = old | x;
-  return old;
-}
-
-uint16_t atomicOrU16(_Atomic(uint16_t) *p, uint16_t x){
-  uint16_t old = *p;
-  *p = old | x;
-  return old;
-}
-
-uint8_t atomicOrU8(_Atomic(uint8_t) *p, uint8_t x){
-  uint8_t old = *p;
-  *p = old | x;
-  return old;
-}
+ZOS_WORD_RMW(atomicOrInt, int, int, oldSub | x)
+ZOS_DWORD_RMW(atomicOrU64, uint64_t, oldSub | x)
+ZOS_WORD_RMW(atomicOrU32, _Atomic(uint32_t), uint32_t, oldSub | x)
+ZOS_SUBWORD_RMW(atomicOrU16, uint16_t, 2, 0xFFFFu, oldSub | x)
+ZOS_SUBWORD_RMW(atomicOrU8, uint8_t, 1, 0xFFu, oldSub | x)
 
 /* XOR */
-int atomicXorInt(int *p, int x){
-  int old = *p;
-  *p = old ^ x;
-  return old;
-}
-
-uint64_t atomicXorU64(_Atomic(uint64_t) *p, uint64_t x){
-  uint64_t old = *p;
-  *p = old ^ x;
-  return old;
-}
-
-uint32_t atomicXorU32(_Atomic(uint32_t) *p, uint32_t x){
-  uint32_t old = *p;
-  *p = old ^ x;
-  return old;
-}
-
-uint16_t atomicXorU16(_Atomic(uint16_t) *p, uint16_t x){
-  uint16_t old = *p;
-  *p = old ^ x;
-  return old;
-}
-
-uint8_t atomicXorU8(_Atomic(uint8_t) *p, uint8_t x){
-  uint8_t old = *p;
-  *p = old ^ x;
-  return old;
-}
+ZOS_WORD_RMW(atomicXorInt, int, int, oldSub ^ x)
+ZOS_DWORD_RMW(atomicXorU64, uint64_t, oldSub ^ x)
+ZOS_WORD_RMW(atomicXorU32, _Atomic(uint32_t), uint32_t, oldSub ^ x)
+ZOS_SUBWORD_RMW(atomicXorU16, uint16_t, 2, 0xFFFFu, oldSub ^ x)
+ZOS_SUBWORD_RMW(atomicXorU8, uint8_t, 1, 0xFFu, oldSub ^ x)
 
 /* LOAD */
 int atomicLoadInt(int *p){
@@ -436,85 +392,47 @@ void atomicStoreU8(_Atomic(uint8_t) *p, uint8_t x){
 }
 
 /* Exchange */
-int atomicExchangeInt(int *p, int x){
-  int old = *p;
-  *p = x;
-  return old;
-}
+ZOS_WORD_RMW(atomicExchangeInt, int, int, x)
+ZOS_DWORD_RMW(atomicExchangeU64, uint64_t, x)
+ZOS_WORD_RMW(atomicExchangeU32, _Atomic(uint32_t), uint32_t, x)
+ZOS_SUBWORD_RMW(atomicExchangeU16, uint16_t, 2, 0xFFFFu, x)
+ZOS_SUBWORD_RMW(atomicExchangeU8, uint8_t, 1, 0xFFu, x)
 
-uint64_t atomicExchangeU64(_Atomic(uint64_t) *p, uint64_t x){
-  uint64_t old = *p;
-  *p = x;
-  return old;
-}
-
-uint32_t atomicExchangeU32(_Atomic(uint32_t) *p, uint32_t x){
-  uint32_t old = *p;
-  *p = x;
-  return old;
-}
-
-uint16_t atomicExchangeU16(_Atomic(uint16_t) *p, uint16_t x){
-  uint16_t old = *p;
-  *p = x;
-  return old;
-}
-
-uint8_t atomicExchangeU8(_Atomic(uint8_t) *p, uint8_t x){
-  uint8_t old = *p;
-  *p = x;
-  return old;
-}
-
-/* Compare_Exchange_Strong */
 _Bool atomicCompareExchangeStrongInt(int *p, int *exp, int desired){
-  if (*p == *exp){
-    *p = desired;
-    return true;
-  } else{
-    *exp = *p;
-    return false;
-  } 
+  uint32_t oldValue = (uint32_t)*exp;
+  _Bool ok = zosCas32((uint32_t *)p, &oldValue, (uint32_t)desired);
+  *exp = (int)oldValue;
+  return ok;
 }
 
 _Bool atomicCompareExchangeStrongU64(_Atomic(uint64_t) *p, uint64_t *exp, uint64_t desired){
-  if (*p == *exp){
-    *p = desired;
-    return true;
-  } else{
-    *exp = *p;
-    return false;
-  } 
+  return zosCas64((uint64_t *)p, exp, desired);
 }
 
 _Bool atomicCompareExchangeStrongU32(_Atomic(uint32_t) *p, uint32_t *exp, uint32_t desired){
-  if (*p == *exp){
-    *p = desired;
-    return true;
-  } else{
-    *exp = *p;
-    return false;
-  } 
+  return zosCas32((uint32_t *)p, exp, desired);
 }
 
 _Bool atomicCompareExchangeStrongU16(_Atomic(uint16_t) *p, uint16_t *exp, uint16_t desired){
-  if (*p == *exp){
-    *p = desired;
-    return true;
-  } else{
-    *exp = *p;
-    return false;
-  } 
+  uint32_t *word;
+  uint32_t shift = zosSubwordShift(p, 2, &word);
+  uint32_t oldWord = *word;
+  for (;;) {
+    uint16_t curSub = (uint16_t)((oldWord >> shift) & 0xFFFFu);
+    if (curSub != *exp) { *exp = curSub; return false; }
+    uint32_t newWord = (oldWord & ~(0xFFFFu << shift)) | ((uint32_t)desired << shift);
+    if (zosCas32(word, &oldWord, newWord)) return true;
+  }
 }
 
 _Bool atomicCompareExchangeStrongU8(_Atomic(uint8_t) *p, uint8_t *exp, uint8_t desired){
-  if (*p == *exp){
-    *p = desired;
-    return true;
-  } else{
-    *exp = *p;
-    return false;
-  } 
+  uint32_t *word;
+  uint32_t shift = zosSubwordShift(p, 1, &word);
+  uint32_t oldWord = *word;
+  for (;;) {
+    uint8_t curSub = (uint8_t)((oldWord >> shift) & 0xFFu);
+    if (curSub != *exp) { *exp = curSub; return false; }
+    uint32_t newWord = (oldWord & ~(0xFFu << shift)) | ((uint32_t)desired << shift);
+    if (zosCas32(word, &oldWord, newWord)) return true;
+  }
 }
-
-
