@@ -212,7 +212,7 @@ function test_string()
     assert(a.substring(1, 3), "bc", "substring");
     a = String.fromCharCode(0x20ac);
     assert(a.charCodeAt(0), 0x20ac, "unicode");
-    assert(a, "", "unicode");
+    assert(a, "€", "unicode");
     assert(a, "\u20ac", "unicode");
     assert(a, "\u{20ac}", "unicode");
     assert("a", "\x61", "unicode");
