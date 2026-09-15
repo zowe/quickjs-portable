@@ -8,6 +8,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifndef NDEBUG
+#define NDEBUG
+#endif
+#include <assert.h>
 #include "polyfill.h"
 
 size_t malloc_usable_size (const void *ptr){
@@ -46,6 +50,11 @@ void execChildError(const char *what){
 #endif
 
 // zosCas32/64 = z/OS Compare And Swap
+// CS requires `place` on a word (4-byte) boundary and CSG/CDS require a
+// doubleword (8-byte) boundary; a misaligned operand raises a specification
+// exception (program interrupt 0C6). Callers in this codebase only ever pass
+// pointers into QuickJS typed-array storage or refcount fields, both of
+// which are naturally aligned, so this is not checked at runtime here.
 static _Bool zosCas32(uint32_t *place, uint32_t *expected, uint32_t desired){
   uint32_t oldValue = *expected;
   int pswMask = 0;
@@ -95,16 +104,16 @@ static _Bool zosCas64(uint64_t *place, uint64_t *expected, uint64_t desired){
         : "r9","r10","r11","memory");
 #else
   int32_t addr = (int32_t)place;
-  __asm("         LM  8,9,%0   \n"
-        "         LM  10,11,%2 \n"
-        "         L   12,%3    \n"
-        "         CDS 8,10,0(12) \n"  // COMPARE DOUBLE AND SWAP
-        "         STM 8,9,%0   \n"
-        "         EPSW 12,0    \n"
-        "         ST  12,%1    "
+  __asm("         LM  6,7,%0    \n"
+        "         LM  8,9,%2    \n"
+        "         L   10,%3     \n"
+        "         CDS 6,8,0(10) \n"  // COMPARE DOUBLE AND SWAP
+        "         STM 6,7,%0    \n"
+        "         EPSW 10,0     \n"
+        "         ST  10,%1     "
         : "+m"(oldValue), "=m"(pswMask)
         : "m"(desired), "m"(addr)
-        : "r8","r9","r10","r11","r12","memory");
+        : "r6","r7","r8","r9","r10","memory");
 #endif
   *expected = oldValue;
   return (_Bool)((pswMask & 0x3000) == 0);
@@ -265,6 +274,8 @@ int changeExtendedAttributes(const char *pathname, int attribute, bool onOff){
 static uint32_t zosSubwordShift(const volatile void *p, int width, uint32_t **outWord){
   uintptr_t addr = (uintptr_t)p;
   uintptr_t wordAddr = addr & ~(uintptr_t)3;
+  assert((width & (width - 1)) == 0);
+  assert((addr & (uintptr_t)(width - 1)) == 0);
   *outWord = (uint32_t *)wordAddr;
   /* z/Architecture is big-endian: byte 0 of the word is the MSB. */
   return (uint32_t)((4 - width - (int)(addr - wordAddr)) * 8);
