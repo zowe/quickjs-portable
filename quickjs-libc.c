@@ -3299,7 +3299,7 @@ static JSContext *(*js_worker_new_context_func)(JSRuntime *rt);
 static int atomic_add_int(int *ptr, int v)
 {
 #ifdef __MVS__
-    return atomicIncrementI32(ptr,v); /* JOENemo */
+    return atomicIncrementI32(ptr,v) + v;
 #else
     return atomic_fetch_add((_Atomic(uint32_t) *)ptr, v) + v;
 #endif
