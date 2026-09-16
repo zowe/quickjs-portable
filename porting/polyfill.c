@@ -54,10 +54,12 @@ static char *leCAA(void){
   char *laa = *(char * __ptr32 * __ptr32)0x4B8;   /* PSALAA: the LE library anchor area */
   char *lca = *(char **)(laa + 0x58);             /* CEELAA_LCA64 */
   return *(char **)(lca + 0x08);                  /* CEELCA_CAA   */
-#else
+#elif defined(__XPLINK__)
   char *caa;
   __asm("         LA    %0,0(,12)" : "=r"(caa));  /* R12 addresses the CAA in AMODE 31 */
   return caa;
+#else
+  return NULL;                                    /* unknown linkage: caller treats it as heap checking on */
 #endif
 }
 
