@@ -10,20 +10,135 @@
 #include <fcntl.h>
 #include "polyfill.h"
 
-size_t malloc_usable_size (const void *ptr){
-  char *data = (char*)ptr;
-  int64_t address =  (int64_t)ptr;
-  if (address > 0x100000000l){
-    data -= 4;
-    return *((int*)data) - 0x10; /* that's the 64 bit malloc overhead */
-  } else{
-    data -= 4;
+/* ---- Does Language Environment say the heap element header is untrustworthy?
+ *
+ * The runtime options in effect live in LE's Options Control Block, three
+ * pointers from the CAA:   CAA -> EDB (CEECAAEDB) -> OCB (CEEEDBOPTCB).
+ * The offsets below come from the CEECAA, CEEEDB and CEEOCB mappings in
+ * CEE.SCEEMAC (SYSSTATE AMODE64=YES selects the 64-bit CAA and EDB forms;
+ * the OCB layout is the same in both modes) and were verified on z/OS 3.1
+ * under each option. Three things the mappings do not say: the 64-bit OCB's
+ * eyecatcher is CELQOCB rather than CEEOCB; CEEOCB_*_SUB_OPTIONS holds an
+ * offset within the OCB, not an address; HEAPZONES has no ON bit and must
+ * be judged by its sizes.
+ *
+ * Every hop is checked. When anything looks wrong the answer is "active",
+ * which costs a fast path, never memory safety.
+ */
+
 #ifdef _LP64
-    return *((int*)data) - 0x10; /* that's the 31 bit malloc overhead */
+#define LE_CAA_EDB               0x388  /* CEECAAEDB    AD(EDB)      */
+#define LE_CAA_SELF              0x3A0  /* CEECAAPTR    AD(this CAA) */
+#define LE_EDB_OPTCB             0x110  /* CEEEDBOPTCB  AD(OCB)      */
 #else
-    return *((int*)data) - 0x08; /* that's the 31 bit malloc overhead */
+#define LE_CAA_EDB               0x2F0  /* CEECAAEDB    A(EDB)       */
+#define LE_CAA_SELF              0x2FC  /* CEECAAPTR    A(this CAA)  */
+#define LE_EDB_OPTCB             0x010  /* CEEEDBOPTCB  A(OCB)       */
+#endif
+#define LE_OCB_LENGTH            0x00A  /* CEEOCB_LENGTH                 H */
+#define LE_OCB_HEAPCHK           0x1D4  /* CEEOCB_HEAPCHK_BIT_FLAG       X */
+#define LE_OCB_HEAPPOOLS         0x1E4  /* CEEOCB_HEAPPOOLS_BIT_FLAG     X */
+#define LE_OCB_HEAPPOOLS64       0x20C  /* CEEOCB_HEAPPOOLS64_BIT_FLAG   X */
+#define LE_OCB_HEAPZONES_SUBOPTS 0x250  /* CEEOCB_HEAPZONES_SUB_OPTIONS  A, an offset */
+#define LE_OCB_OPTION_ON         0x80   /* CEEOCB_*_ON                     */
+#define LE_HEAPZONES_SIZE31      0x04   /* CEEOCB_HEAPZONES_SIZE31, in the sub-options */
+#define LE_HEAPZONES_SIZE64      0x0C   /* CEEOCB_HEAPZONES_SIZE64                     */
+
+/* EBCDIC: this file is compiled in ASCII char mode, so no string literals. */
+static const unsigned char LE_EYE_CEEEDB[6]  = {0xC3,0xC5,0xC5,0xC5,0xC4,0xC2};      /* CEEEDB  */
+static const unsigned char LE_EYE_CEEOCB[6]  = {0xC3,0xC5,0xC5,0xD6,0xC3,0xC2};      /* CEEOCB  */
+static const unsigned char LE_EYE_CELQOCB[7] = {0xC3,0xC5,0xD3,0xD8,0xD6,0xC3,0xC2}; /* CELQOCB */
+
+static char *leCAA(void){
+#ifdef _LP64
+  char *laa = *(char * __ptr32 * __ptr32)0x4B8;   /* PSALAA: the LE library anchor area */
+  char *lca = *(char **)(laa + 0x58);             /* CEELAA_LCA64 */
+  return *(char **)(lca + 0x08);                  /* CEELCA_CAA   */
+#elif defined(__XPLINK__)
+  char *caa;
+  __asm("         LA    %0,0(,12)" : "=r"(caa));  /* R12 addresses the CAA in AMODE 31 */
+  return caa;
+#else
+  return NULL;                                    /* unknown linkage: caller treats it as heap checking on */
+#endif
+}
+
+static int leHeapCheckActive(void){
+  char *caa = leCAA();
+  if (caa == NULL || *(char **)(caa + LE_CAA_SELF) != caa) {
+    return 1;
+  }
+  char *edb = *(char **)(caa + LE_CAA_EDB);
+  if (edb == NULL || memcmp(edb, LE_EYE_CEEEDB, sizeof(LE_EYE_CEEEDB)) != 0) {
+    return 1;
+  }
+  char *ocb = *(char **)(edb + LE_EDB_OPTCB);
+  if (ocb == NULL ||
+      (memcmp(ocb, LE_EYE_CELQOCB, sizeof(LE_EYE_CELQOCB)) != 0 &&
+       memcmp(ocb, LE_EYE_CEEOCB,  sizeof(LE_EYE_CEEOCB))  != 0)) {
+    return 1;
+  }
+
+  unsigned int zoneSize  = 0;
+  unsigned int ocbLength = *(unsigned short *)(ocb + LE_OCB_LENGTH);
+  unsigned int zonesRef  = *(unsigned int *)(ocb + LE_OCB_HEAPZONES_SUBOPTS);
+  if (zonesRef != 0) {
+    if (zonesRef >= ocbLength) {
+      return 1;                                   /* not the offset we expect */
+    }
+#ifdef _LP64
+    zoneSize = *(unsigned int *)(ocb + zonesRef + LE_HEAPZONES_SIZE64);
+#else
+    zoneSize = *(unsigned int *)(ocb + zonesRef + LE_HEAPZONES_SIZE31);
 #endif
   }
+#ifdef _LP64
+  unsigned char pools = *(unsigned char *)(ocb + LE_OCB_HEAPPOOLS64);
+#else
+  unsigned char pools = *(unsigned char *)(ocb + LE_OCB_HEAPPOOLS);
+#endif
+  unsigned char heapchk = *(unsigned char *)(ocb + LE_OCB_HEAPCHK);
+
+  return (pools & LE_OCB_OPTION_ON) != 0 ||
+         zoneSize != 0 ||
+         (heapchk & LE_OCB_OPTION_ON) != 0;
+}
+
+int isLEHeapCheckActive(void){
+  /* Runtime options are fixed for the life of the enclave, so decide once.
+     Two threads arriving together compute the same value; the race is benign. */
+  static int active = -1;
+  if (active < 0) {
+    active = leHeapCheckActive();
+  }
+  return active;
+}
+
+/* ---- malloc_usable_size --------------------------------------------------
+ *
+ * LE keeps the length of a heap element in the header just before the storage
+ * it hands out: a 16-byte header on the 64-bit heap, 8 bytes on the 31-bit
+ * heap, with the low-order word of the length immediately before the user
+ * pointer in both. IBM does not document this, and the options above change
+ * it, so the header is read only when LE says the heap is stock. Even then
+ * the value is checked for the shape a stock element must have.
+ */
+
+#ifdef _LP64
+#define LE_HEAP_ELEMENT_OVERHEAD 0x10
+#else
+#define LE_HEAP_ELEMENT_OVERHEAD 0x08
+#endif
+
+size_t malloc_usable_size (const void *ptr){
+  if (ptr == NULL || isLEHeapCheckActive()) {
+    return 0;
+  }
+  unsigned int elementLength = *(const unsigned int *)((const char *)ptr - 4);
+  if (elementLength < LE_HEAP_ELEMENT_OVERHEAD || (elementLength & 7) != 0) {
+    return 0;                                     /* not a stock element header */
+  }
+  return elementLength - LE_HEAP_ELEMENT_OVERHEAD;
 }
 
 #ifdef __MVS__
