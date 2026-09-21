@@ -214,7 +214,20 @@ typedef struct fake_int128_tag{
 
 void printf2(char *fmt, ...);
 
+/* Usable size of a malloc'd block, read from the Language Environment heap
+   element header, or 0 when that header cannot be trusted (see
+   isLEHeapCheckActive). quickjs treats 0 as "unknown": it only loses the
+   append-in-place fast path and exact malloc accounting, never safety. */
 size_t malloc_usable_size (const void *ptr);
+
+/* Nonzero when a Language Environment runtime option changes the layout of
+   heap elements for this program's heap: HEAPPOOLS64 (64-bit) or HEAPPOOLS
+   (31-bit) replace the element length with a pool index, HEAPZONES appends
+   a check zone that the length includes, HEAPCHK is treated the same way to
+   be safe. Also nonzero when LE's control blocks cannot be verified. Read
+   from LE's options control block once; the answer is fixed for the life of
+   the enclave. */
+int isLEHeapCheckActive(void);
 
 int32_t atomicIncrementI32(int32_t *intPointer, int32_t increment);
 int64_t atomicIncrementI64(int64_t *intPointer, int64_t increment);
