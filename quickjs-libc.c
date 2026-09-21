@@ -1067,6 +1067,22 @@ static FILE *js_std_file_get(JSContext *ctx, JSValueConst obj)
     return s->f;
 }
 
+static int js_std_fwrite_all(JSContext *ctx, FILE *f, const char *buf, size_t len) {
+    while (len > 0) {
+        size_t ret = fwrite(buf, 1, len, f);
+        if (ret == 0) {
+            if (ferror(f)) {
+                JS_ThrowTypeError(ctx, "write error: %s", strerror(errno));
+                return -1;
+            }
+            break;  // no progress and no error: break rather than spin forever
+        }
+        buf += ret;
+        len -= ret;
+    }
+    return 0;
+}
+
 static JSValue js_std_file_puts(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int magic)
 {
@@ -1082,12 +1098,15 @@ static JSValue js_std_file_puts(JSContext *ctx, JSValueConst this_val,
         if (!f)
             return JS_EXCEPTION;
     }
-    
+
     for(i = 0; i < argc; i++) {
         str = JS_ToCStringLen(ctx, &len, argv[i]);
         if (!str)
             return JS_EXCEPTION;
-        fwrite(str, 1, len, f);
+        if (js_std_fwrite_all(ctx, f, str, len)) {
+            JS_FreeCString(ctx, str);
+            return JS_EXCEPTION;
+        }
         JS_FreeCString(ctx, str);
     }
     return JS_UNDEFINED;
@@ -3892,7 +3911,10 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
         str = JS_ToCStringLen(ctx, &len, argv[i]);
         if (!str)
             return JS_EXCEPTION;
-        fwrite(str, 1, len, stdout);
+        if (js_std_fwrite_all(ctx, stdout, str, len)) {
+            JS_FreeCString(ctx, str);
+            return JS_EXCEPTION;
+        }
         JS_FreeCString(ctx, str);
     }
     putchar('\n');
